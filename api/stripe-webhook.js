@@ -1,24 +1,36 @@
-// Vercel Serverless Function: Stripe → BigCommerce (Intro → group 2 only for now)
+// Vercel Serverless Function: Stripe → BigCommerce (Intro -> group 2)
 import Stripe from 'stripe';
+
+const stripe = new Stripe(process.env.STRIPE_SECRET, { apiVersion: '2024-06-20' });
+
+// Helper: read raw body (required for Stripe signature verification)
+async function getRawBody(req) {
+  const chunks = [];
+  for await (const chunk of req) {
+    chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+  }
+  return Buffer.concat(chunks);
+}
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
-    res.status(405).send('Method Not Allowed'); return;
+    res.status(405).send('Method Not Allowed');
+    return;
   }
 
-  const sig = req.headers['stripe-signature'];
-  const stripe = new Stripe(process.env.STRIPE_SECRET, { apiVersion: '2024-06-20' });
-
-  // Verify signature with RAW body
+  // 1) Verify Stripe signature with RAW body
   let event;
   try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+    const sig = req.headers['stripe-signature'];
+    const rawBody = await getRawBody(req);
+    event = stripe.webhooks.constructEvent(rawBody, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
     console.error('❌ Verification failed:', err.message);
-    res.status(400).send(`Webhook Error: ${err.message}`); return;
+    res.status(400).send(`Webhook Error: ${err.message}`);
+    return;
   }
 
-  // Collect purchased price IDs + email from the event
+  // 2) Collect price IDs + email
   const foundPriceIds = new Set();
   const type = event.type;
 
@@ -27,7 +39,10 @@ export default async function handler(req, res) {
       const s = await stripe.checkout.sessions.retrieve(sessionId, { expand: ['line_items.data.price.product'] });
       (s.line_items?.data || []).forEach(li => li.price?.id && foundPriceIds.add(li.price.id));
       return s;
-    } catch (e) { console.error('Session retrieve failed', e); return null; }
+    } catch (e) {
+      console.error('Session retrieve failed', e);
+      return null;
+    }
   }
 
   function collectFromInvoice(invoice) {
@@ -50,12 +65,18 @@ export default async function handler(req, res) {
       try { const c = await stripe.customers.retrieve(inv.customer); email = c?.email || null; } catch {}
     }
   } else {
-    res.status(200).json({ ok: true }); return;
+    // Ignore other events for now
+    res.status(200).json({ ok: true });
+    return;
   }
 
-  if (!email) { console.warn('⚠️ No email; skipping'); res.status(200).json({ ok: true }); return; }
+  if (!email) {
+    console.warn('⚠️ No email; skipping');
+    res.status(200).json({ ok: true });
+    return;
+  }
 
-  // Map Stripe Price IDs → BigCommerce group id (Intro = Group 2)
+  // 3) Map Stripe Price IDs → BigCommerce group id (Intro = Group 2)
   const PRICE_TO_GROUP = {
     [process.env.PRICE_INTRO_MONTHLY]: 2,
     [process.env.PRICE_INTRO_YEARLY]: 2
@@ -66,6 +87,7 @@ export default async function handler(req, res) {
     if (pid && PRICE_TO_GROUP[pid]) { targetGroupId = PRICE_TO_GROUP[pid]; break; }
   }
 
+  // 4) Upsert customer in BigCommerce and set group
   try {
     const base = `https://api.bigcommerce.com/stores/${process.env.BC_STORE_HASH}`;
     const headers = {
@@ -109,6 +131,3 @@ export default async function handler(req, res) {
     res.status(500).json({ ok: false, error: e.message });
   }
 }
-
-// Disable parsing so Stripe signature works
-export const config = { api: { bodyParser: false } };
