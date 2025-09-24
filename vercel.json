@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "functions": {
+    "api/stripe-webhook.js": {
+      "runtime": "nodejs18.x"
+    }
+  },
+  "routes": [
+    { "src": "/api/stripe-webhook", "dest": "/api/stripe-webhook.js" }
+  ]
+}
