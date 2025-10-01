@@ -1,8 +1,4 @@
-// Vercel Serverless Function: Stripe → BigCommerce (auto-assign groups)
-// - Supports both checkout.session.completed and invoice.payment_succeeded
-// - Reads price IDs from li.price.id OR li.pricing.price_details.price
-// - Uses PRICE_TO_GROUP_MAP env JSON (e.g. {"price_ABC":2,"price_DEF":2})
-
+// Vercel Serverless Function: Stripe → BigCommerce (Intro -> group 2)
 import Stripe from 'stripe';
 
 // Keep raw body for Stripe signature verification
@@ -10,14 +6,13 @@ export const config = { api: { bodyParser: false } };
 
 const stripe = new Stripe(process.env.STRIPE_SECRET, { apiVersion: '2024-06-20' });
 
-// Helper: read raw body (required for Stripe signature verification)
+// ---------- helpers ----------
 async function getRawBody(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
   return Buffer.concat(chunks);
 }
 
-// ---------- BigCommerce HELPERS ----------
 function bcHeaders() {
   return {
     'X-Auth-Client': process.env.BC_CLIENT_ID,
@@ -30,14 +25,9 @@ function bcBase() {
   return `https://api.bigcommerce.com/stores/${process.env.BC_STORE_HASH}/v3`;
 }
 
-// /v3/customers/lookup → get by email
 async function lookupBcCustomerIdByEmail(email) {
   const url = `${bcBase()}/customers/lookup`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: bcHeaders(),
-    body: JSON.stringify({ emails: [email] })
-  });
+  const res = await fetch(url, { method: 'POST', headers: bcHeaders(), body: JSON.stringify({ emails: [email] }) });
   const txt = await res.text().catch(() => '');
   if (!res.ok) throw new Error(`BC lookup failed (${res.status}): ${txt}`);
   let json = {};
@@ -48,11 +38,7 @@ async function lookupBcCustomerIdByEmail(email) {
 
 async function createBcCustomer(email, firstName = '', lastName = '') {
   const payload = { customers: [{ email, first_name: firstName || '', last_name: lastName || '' }] };
-  const res = await fetch(`${bcBase()}/customers`, {
-    method: 'POST',
-    headers: bcHeaders(),
-    body: JSON.stringify(payload)
-  });
+  const res = await fetch(`${bcBase()}/customers`, { method: 'POST', headers: bcHeaders(), body: JSON.stringify(payload) });
   const txt = await res.text().catch(() => '');
   if (!res.ok) throw new Error(`BC create failed (${res.status}): ${txt}`);
   let json = {};
@@ -62,23 +48,23 @@ async function createBcCustomer(email, firstName = '', lastName = '') {
 
 async function setBcCustomerGroup(customerId, groupId) {
   const payload = { customers: [{ id: Number(customerId), customer_group_id: Number(groupId) }] };
-  const res = await fetch(`${bcBase()}/customers`, {
-    method: 'PUT',
-    headers: bcHeaders(),
-    body: JSON.stringify(payload)
-  });
+  const res = await fetch(`${bcBase()}/customers`, { method: 'PUT', headers: bcHeaders(), body: JSON.stringify(payload) });
   const txt = await res.text().catch(() => '');
   if (!res.ok) throw new Error(`BC group update failed (${res.status}): ${txt}`);
 }
 
-// ---------- PRICE COLLECTION ----------
-function pushPriceIdFromLine(foundPriceIds, li) {
-  // Supports both older and newer Stripe shapes
-  const pid =
-    li?.price?.id /* classic */ ||
-    li?.pricing?.price_details?.price /* newer invoice line shape */;
-  if (pid) foundPriceIds.add(pid);
+// Normalize price id across Stripe API versions/shapes
+function extractPriceIdFromLineItem(li) {
+  // Older shapes (expanded price object)
+  if (li?.price?.id) return li.price.id;
+  // Sometimes price is a plain string id
+  if (typeof li?.price === 'string') return li.price;
+  // Newer shape (your live event)
+  if (li?.pricing?.price_details?.price) return li.pricing.price_details.price;
+  return null;
 }
+
+// ---------------------------------
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -101,15 +87,14 @@ export default async function handler(req, res) {
   // 2) Collect price IDs + purchaser email
   const foundPriceIds = new Set();
   const type = event.type;
-  let email = null;
-  let fullName = '';
 
   async function collectFromSession(sessionId) {
     try {
-      const s = await stripe.checkout.sessions.retrieve(sessionId, {
-        expand: ['line_items.data.price.product']
+      const s = await stripe.checkout.sessions.retrieve(sessionId, { expand: ['line_items.data.price.product'] });
+      (s.line_items?.data || []).forEach(li => {
+        const pid = extractPriceIdFromLineItem(li);
+        if (pid) foundPriceIds.add(pid);
       });
-      (s.line_items?.data || []).forEach(li => pushPriceIdFromLine(foundPriceIds, li));
       return s;
     } catch (e) {
       console.error('Session retrieve failed', e);
@@ -118,30 +103,28 @@ export default async function handler(req, res) {
   }
 
   function collectFromInvoice(invoice) {
-    (invoice.lines?.data || []).forEach(li => pushPriceIdFromLine(foundPriceIds, li));
+    (invoice.lines?.data || []).forEach(li => {
+      const pid = extractPriceIdFromLineItem(li);
+      if (pid) foundPriceIds.add(pid);
+    });
   }
+
+  let email = null;
+  let fullName = '';
 
   if (type === 'checkout.session.completed') {
     const s = await collectFromSession(event.data.object.id);
     email = s?.customer_details?.email || s?.customer_email || null;
     fullName = s?.customer_details?.name || '';
     if (!email && s?.customer) {
-      try {
-        const c = await stripe.customers.retrieve(s.customer);
-        email = c?.email || email;
-        fullName = fullName || c?.name || '';
-      } catch {}
+      try { const c = await stripe.customers.retrieve(s.customer); email = c?.email || null; fullName = fullName || c?.name || ''; } catch {}
     }
   } else if (type === 'invoice.payment_succeeded') {
     const inv = event.data.object;
     collectFromInvoice(inv);
     email = inv?.customer_email || inv?.customer_details?.email || null;
     if (inv?.customer) {
-      try {
-        const c = await stripe.customers.retrieve(inv.customer);
-        if (!email) email = c?.email || null;
-        fullName = fullName || c?.name || '';
-      } catch {}
+      try { const c = await stripe.customers.retrieve(inv.customer); fullName = fullName || c?.name || ''; if (!email) email = c?.email || null; } catch {}
     }
   } else {
     // Ignore other events
@@ -155,17 +138,24 @@ export default async function handler(req, res) {
     return;
   }
 
-  // 3) Map Stripe Price IDs → BigCommerce group id via PRICE_TO_GROUP_MAP env
-  let MAP = {};
-  try { MAP = JSON.parse(process.env.PRICE_TO_GROUP_MAP || '{}'); } catch {}
-  let targetGroupId = null;
-  for (const pid of foundPriceIds) {
-    if (pid && MAP[pid]) { targetGroupId = MAP[pid]; break; }
+  // 3) Map Stripe Price IDs → BigCommerce group id (Intro = Group 2)
+  // Prefer the JSON map if provided; else fallback to two env vars.
+  let PRICE_TO_GROUP = {};
+  try {
+    if (process.env.PRICE_TO_GROUP_MAP) PRICE_TO_GROUP = JSON.parse(process.env.PRICE_TO_GROUP_MAP);
+  } catch {}
+  if (!Object.keys(PRICE_TO_GROUP).length) {
+    PRICE_TO_GROUP = {
+      [process.env.PRICE_INTRO_MONTHLY]: 2,
+      [process.env.PRICE_INTRO_YEARLY]:  2
+    };
   }
 
-  console.log(
-    `Prices in event: ${[...foundPriceIds].join(', ') || '(none)'} → target group: ${targetGroupId ?? '(none)'} for ${email}`
-  );
+  let targetGroupId = null;
+  for (const pid of foundPriceIds) {
+    if (pid && PRICE_TO_GROUP[pid]) { targetGroupId = PRICE_TO_GROUP[pid]; break; }
+  }
+  console.log(`Prices in event: ${[...foundPriceIds].join(', ') || '(none)'} → target group: ${targetGroupId ?? '(none)'} for ${email}`);
 
   // 4) Upsert customer in BigCommerce and set group
   try {
@@ -173,7 +163,6 @@ export default async function handler(req, res) {
     const lastName  = fullName ? fullName.split(' ').slice(1).join(' ') : '';
 
     let bcCustomerId = await lookupBcCustomerIdByEmail(email);
-
     if (!bcCustomerId) {
       bcCustomerId = await createBcCustomer(email, firstName, lastName);
       if (!bcCustomerId) throw new Error('BC create returned no id.');
@@ -186,7 +175,7 @@ export default async function handler(req, res) {
       await setBcCustomerGroup(bcCustomerId, targetGroupId);
       console.log(`✅ Set group ${targetGroupId} for ${email} (BC id ${bcCustomerId})`);
     } else {
-      console.log(`ℹ️ No mapped tier in this purchase for ${email}.`);
+      console.log(`ℹ️ No mapped membership in this purchase for ${email}.`);
     }
 
     res.status(200).json({ ok: true });
