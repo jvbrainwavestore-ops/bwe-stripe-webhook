@@ -25,13 +25,11 @@ function bcHeaders() {
 function bcBaseV3() {
   const hash = (process.env.BC_STORE_HASH || '').trim();
   const url = `https://api.bigcommerce.com/stores/${hash}/v3`;
-  console.log('BC v3 base URL:', url);
   return url;
 }
 function bcBaseV2() {
   const hash = (process.env.BC_STORE_HASH || '').trim();
   const url = `https://api.bigcommerce.com/stores/${hash}/v2`;
-  console.log('BC v2 base URL:', url);
   return url;
 }
 
@@ -44,10 +42,7 @@ async function lookupBcCustomerIdByEmail(email) {
     const url = `${bcBaseV3()}/customers/lookup`;
     const res = await fetch(url, { method: 'POST', headers: bcHeaders(), body: JSON.stringify({ emails: [normalized] }) });
     const txt = await res.text().catch(() => '');
-    if (res.status === 404) {
-      console.warn('BC v3 /customers/lookup returned 404; will try v2 fallback.');
-      throw new Error('__TRY_V2__');
-    }
+    if (res.status === 404) throw new Error('__TRY_V2__');
     if (!res.ok) throw new Error(`BC v3 lookup failed (${res.status}): ${txt}`);
     let json = {};
     try { json = JSON.parse(txt); } catch {}
@@ -87,7 +82,6 @@ async function createBcCustomer({ email, firstName = 'Member', lastName = 'Accou
     const txt = await res.text().catch(() => '');
     if (!res.ok) {
       console.warn(`BC v3 create failed (${res.status}): ${txt}`);
-      // v3 validation/route issues? fall back to v2
       throw new Error('__TRY_V2_CREATE__');
     }
     let json = {};
@@ -117,45 +111,29 @@ async function createBcCustomer({ email, firstName = 'Member', lastName = 'Accou
   return { id: id2, groupAppliedAtCreate: false };
 }
 
-// UPDATED: assign customer group with PATCH (single) → fallback to PUT (array)
+// Assign customer group with PATCH (single) → fallback to PUT (bulk ARRAY body)
 async function setBcCustomerGroup(customerId, groupId) {
   const headers = bcHeaders();
   const v3 = bcBaseV3();
 
-  // 1) Preferred: single-customer endpoint with PATCH (object body)
+  // 1) Preferred: single-customer PATCH
   try {
     const url = `${v3}/customers/${Number(customerId)}`;
     const body = JSON.stringify({ customer_group_id: Number(groupId) });
     const res = await fetch(url, { method: 'PATCH', headers, body });
     const txt = await res.text().catch(() => '');
-    if (res.ok) {
-      // Some stores return 204 No Content; if there is a body, we can sanity-check it.
-      if (txt) {
-        try {
-          const json = JSON.parse(txt);
-          if (json?.data?.customer_group_id && Number(json.data.customer_group_id) !== Number(groupId)) {
-            throw new Error(`BC PATCH returned different group: ${json.data.customer_group_id}`);
-          }
-        } catch { /* ignore parse issues if not JSON */ }
-      }
-      return; // success
-    }
-    // If BC complains about expecting array, fall through to array PUT
-    const mustUseArray = res.status === 422 || /array/i.test(txt || '');
-    if (!mustUseArray) {
-      throw new Error(`BC group PATCH failed (${res.status}): ${txt}`);
-    }
+    if (res.ok) return;
+    // If BC complains or doesn’t support, fall through
+    const mustUseBulk = res.status === 422 || res.status === 404 || /array/i.test(txt || '');
+    if (!mustUseBulk) throw new Error(`BC group PATCH failed (${res.status}): ${txt}`);
   } catch (e) {
-    // Proceed to fallback
-    console.warn('PATCH group failed or not supported, trying bulk PUT:', e.message);
+    console.warn('PATCH group failed; trying bulk PUT:', e.message);
   }
 
-  // 2) Fallback: bulk endpoint with PUT (array body)
+  // 2) Bulk PUT requires a TOP-LEVEL ARRAY, not { customers: [...] }
   const url2 = `${v3}/customers`;
-  const body2 = JSON.stringify({
-    customers: [{ id: Number(customerId), customer_group_id: Number(groupId) }]
-  });
-  const res2 = await fetch(url2, { method: 'PUT', headers, body: body2 });
+  const payloadArray = [{ id: Number(customerId), customer_group_id: Number(groupId) }];
+  const res2 = await fetch(url2, { method: 'PUT', headers, body: JSON.stringify(payloadArray) });
   const txt2 = await res2.text().catch(() => '');
   if (!res2.ok) throw new Error(`BC group PUT failed (${res2.status}): ${txt2}`);
 }
@@ -248,7 +226,6 @@ export default async function handler(req, res) {
 
   // 4) Upsert customer in BigCommerce and set group
   try {
-    // Split name safely (fallbacks for stores that require names)
     const parts = (fullName || '').trim().split(/\s+/).filter(Boolean);
     const firstName = parts[0] || 'Member';
     const lastName  = parts.slice(1).join(' ') || 'Account';
@@ -256,7 +233,7 @@ export default async function handler(req, res) {
     // A) Lookup by email (v3→v2)
     let bcCustomerId = await lookupBcCustomerIdByEmail(email);
 
-    // B) Create if missing (v3 create→v2 create). If we know the group, try to set it at create time.
+    // B) Create if missing (v3→v2). If we know the group, try to set it at create time.
     let groupAppliedAtCreate = false;
     if (!bcCustomerId) {
       const created = await createBcCustomer({ email, firstName, lastName, groupId: targetGroupId || null });
