@@ -117,11 +117,47 @@ async function createBcCustomer({ email, firstName = 'Member', lastName = 'Accou
   return { id: id2, groupAppliedAtCreate: false };
 }
 
+// UPDATED: assign customer group with PATCH (single) → fallback to PUT (array)
 async function setBcCustomerGroup(customerId, groupId) {
-  const payload = { customers: [{ id: Number(customerId), customer_group_id: Number(groupId) }] };
-  const res = await fetch(`${bcBaseV3()}/customers`, { method: 'PUT', headers: bcHeaders(), body: JSON.stringify(payload) });
-  const txt = await res.text().catch(() => '');
-  if (!res.ok) throw new Error(`BC group update failed (${res.status}): ${txt}`);
+  const headers = bcHeaders();
+  const v3 = bcBaseV3();
+
+  // 1) Preferred: single-customer endpoint with PATCH (object body)
+  try {
+    const url = `${v3}/customers/${Number(customerId)}`;
+    const body = JSON.stringify({ customer_group_id: Number(groupId) });
+    const res = await fetch(url, { method: 'PATCH', headers, body });
+    const txt = await res.text().catch(() => '');
+    if (res.ok) {
+      // Some stores return 204 No Content; if there is a body, we can sanity-check it.
+      if (txt) {
+        try {
+          const json = JSON.parse(txt);
+          if (json?.data?.customer_group_id && Number(json.data.customer_group_id) !== Number(groupId)) {
+            throw new Error(`BC PATCH returned different group: ${json.data.customer_group_id}`);
+          }
+        } catch { /* ignore parse issues if not JSON */ }
+      }
+      return; // success
+    }
+    // If BC complains about expecting array, fall through to array PUT
+    const mustUseArray = res.status === 422 || /array/i.test(txt || '');
+    if (!mustUseArray) {
+      throw new Error(`BC group PATCH failed (${res.status}): ${txt}`);
+    }
+  } catch (e) {
+    // Proceed to fallback
+    console.warn('PATCH group failed or not supported, trying bulk PUT:', e.message);
+  }
+
+  // 2) Fallback: bulk endpoint with PUT (array body)
+  const url2 = `${v3}/customers`;
+  const body2 = JSON.stringify({
+    customers: [{ id: Number(customerId), customer_group_id: Number(groupId) }]
+  });
+  const res2 = await fetch(url2, { method: 'PUT', headers, body: body2 });
+  const txt2 = await res2.text().catch(() => '');
+  if (!res2.ok) throw new Error(`BC group PUT failed (${res2.status}): ${txt2}`);
 }
 // ---------------------------------
 
