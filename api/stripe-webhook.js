@@ -1,4 +1,6 @@
-// Vercel Serverless Function: Stripe → BigCommerce (Intro -> group 2)
+// Vercel Serverless Function: Stripe → BigCommerce (Intro/Standard/Collective → groups)
+// === FULL FILE ===
+
 import Stripe from 'stripe';
 
 // Keep raw body for Stripe signature verification
@@ -137,6 +139,37 @@ async function setBcCustomerGroup(customerId, groupId) {
   const txt2 = await res2.text().catch(() => '');
   if (!res2.ok) throw new Error(`BC group PUT failed (${res2.status}): ${txt2}`);
 }
+
+// ---- STRIPE → BC revoke helpers (additions) ----
+
+// get a Stripe customer's email by customerId
+async function getStripeEmailFromCustomerId(customerId) {
+  if (!customerId) return null;
+  try {
+    const c = await stripe.customers.retrieve(customerId);
+    return c && c.email ? String(c.email).trim().toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+// remove membership in BigCommerce by Stripe customerId (sets group 0)
+async function revokeAccessByStripeCustomerId(customerId) {
+  const email = await getStripeEmailFromCustomerId(customerId);
+  if (!email) {
+    console.warn('⚠️ revoke: no email for', customerId);
+    return;
+  }
+  // find BC customer by email; if not found, nothing to do (don’t create on revoke)
+  const bcId = await lookupBcCustomerIdByEmail(email);
+  if (!bcId) {
+    console.log('ℹ️ revoke: no BC customer found for', email);
+    return;
+  }
+  await setBcCustomerGroup(bcId, 0); // 0 = no membership
+  console.log(`✅ revoke: removed access for ${email} (BC ${bcId})`);
+}
+
 // ---------------------------------
 
 export default async function handler(req, res) {
@@ -203,6 +236,20 @@ export default async function handler(req, res) {
     if (inv?.customer) {
       try { const c = await stripe.customers.retrieve(inv.customer); fullName = fullName || c?.name || ''; if (!email) email = c?.email || null; } catch {}
     }
+  } else if (type === 'customer.subscription.updated') {
+    // If a subscription is “canceled” immediately, remove access right now.
+    const sub = event.data.object;
+    if (sub?.status === 'canceled') {
+      await revokeAccessByStripeCustomerId(sub.customer);
+    }
+    res.status(200).json({ ok: true, handled: type });
+    return;
+  } else if (type === 'customer.subscription.deleted') {
+    // Final end of access (after grace/retries or cancel-at-period-end)
+    const sub = event.data.object;
+    await revokeAccessByStripeCustomerId(sub.customer);
+    res.status(200).json({ ok: true, handled: type });
+    return;
   } else {
     // Ignore other events
     res.status(200).json({ ok: true, ignored: type });
