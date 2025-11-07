@@ -1,5 +1,5 @@
-// Vercel Serverless Function: Stripe → BigCommerce (Intro/Standard/Collective → groups)
-// === FULL FILE ===
+// Vercel Serverless Function: Stripe → BigCommerce (maps Stripe prices to BC customer groups)
+// Adds removal on customer.subscription.deleted (+ optional on invoice.payment_failed)
 
 import Stripe from 'stripe';
 
@@ -7,6 +7,12 @@ import Stripe from 'stripe';
 export const config = { api: { bodyParser: false } };
 
 const stripe = new Stripe(process.env.STRIPE_SECRET, { apiVersion: '2024-06-20' });
+
+// === SETTINGS ===
+// Set to true if you want to drop members from their group immediately when a payment fails
+const REMOVE_ON_PAYMENT_FAILED = true;
+// BigCommerce “no group” value. BC treats 0 as “no customer group”.
+const NO_GROUP = 0;
 
 // Helper: read raw body (required for Stripe signature verification)
 async function getRawBody(req) {
@@ -26,13 +32,11 @@ function bcHeaders() {
 }
 function bcBaseV3() {
   const hash = (process.env.BC_STORE_HASH || '').trim();
-  const url = `https://api.bigcommerce.com/stores/${hash}/v3`;
-  return url;
+  return `https://api.bigcommerce.com/stores/${hash}/v3`;
 }
 function bcBaseV2() {
   const hash = (process.env.BC_STORE_HASH || '').trim();
-  const url = `https://api.bigcommerce.com/stores/${hash}/v2`;
-  return url;
+  return `https://api.bigcommerce.com/stores/${hash}/v2`;
 }
 
 // Lookup by email (try v3 /customers/lookup, fall back to v2 /customers?email=)
@@ -113,26 +117,25 @@ async function createBcCustomer({ email, firstName = 'Member', lastName = 'Accou
   return { id: id2, groupAppliedAtCreate: false };
 }
 
-// Assign customer group with PATCH (single) → fallback to PUT (bulk ARRAY body)
+// Assign customer group with PATCH → fallback to bulk PUT
 async function setBcCustomerGroup(customerId, groupId) {
   const headers = bcHeaders();
   const v3 = bcBaseV3();
 
-  // 1) Preferred: single-customer PATCH
+  // 1) Preferred: single PATCH
   try {
     const url = `${v3}/customers/${Number(customerId)}`;
     const body = JSON.stringify({ customer_group_id: Number(groupId) });
     const res = await fetch(url, { method: 'PATCH', headers, body });
     const txt = await res.text().catch(() => '');
     if (res.ok) return;
-    // If BC complains or doesn’t support, fall through
     const mustUseBulk = res.status === 422 || res.status === 404 || /array/i.test(txt || '');
     if (!mustUseBulk) throw new Error(`BC group PATCH failed (${res.status}): ${txt}`);
   } catch (e) {
     console.warn('PATCH group failed; trying bulk PUT:', e.message);
   }
 
-  // 2) Bulk PUT requires a TOP-LEVEL ARRAY, not { customers: [...] }
+  // 2) Bulk PUT requires a TOP-LEVEL ARRAY
   const url2 = `${v3}/customers`;
   const payloadArray = [{ id: Number(customerId), customer_group_id: Number(groupId) }];
   const res2 = await fetch(url2, { method: 'PUT', headers, body: JSON.stringify(payloadArray) });
@@ -140,38 +143,41 @@ async function setBcCustomerGroup(customerId, groupId) {
   if (!res2.ok) throw new Error(`BC group PUT failed (${res2.status}): ${txt2}`);
 }
 
-// ---- STRIPE → BC revoke helpers (additions) ----
+// === STRIPE HELPERS ===
+function priceToGroupId(priceIdSet) {
+  let map = {};
+  try { map = JSON.parse(process.env.PRICE_TO_GROUP_MAP || '{}'); } catch {}
+  for (const pid of priceIdSet) {
+    if (pid && map[pid]) return Number(map[pid]);
+  }
+  return null;
+}
 
-// get a Stripe customer's email by customerId
-async function getStripeEmailFromCustomerId(customerId) {
-  if (!customerId) return null;
+async function collectFromSession(sessionId, foundPriceIds) {
   try {
-    const c = await stripe.customers.retrieve(customerId);
-    return c && c.email ? String(c.email).trim().toLowerCase() : null;
-  } catch {
+    const s = await stripe.checkout.sessions.retrieve(sessionId, { expand: ['line_items.data.price.product'] });
+    (s.line_items?.data || []).forEach(li => {
+      const pidNew = li?.pricing?.price_details?.price;
+      const pidOld = li?.price?.id;
+      if (pidNew) foundPriceIds.add(pidNew);
+      if (pidOld) foundPriceIds.add(pidOld);
+    });
+    return s;
+  } catch (e) {
+    console.error('Session retrieve failed', e);
     return null;
   }
 }
-
-// remove membership in BigCommerce by Stripe customerId (sets group 0)
-async function revokeAccessByStripeCustomerId(customerId) {
-  const email = await getStripeEmailFromCustomerId(customerId);
-  if (!email) {
-    console.warn('⚠️ revoke: no email for', customerId);
-    return;
-  }
-  // find BC customer by email; if not found, nothing to do (don’t create on revoke)
-  const bcId = await lookupBcCustomerIdByEmail(email);
-  if (!bcId) {
-    console.log('ℹ️ revoke: no BC customer found for', email);
-    return;
-  }
-  await setBcCustomerGroup(bcId, 0); // 0 = no membership
-  console.log(`✅ revoke: removed access for ${email} (BC ${bcId})`);
+function collectFromInvoice(invoice, foundPriceIds) {
+  (invoice.lines?.data || []).forEach(li => {
+    const pidNew = li?.pricing?.price_details?.price;
+    const pidOld = li?.price?.id;
+    if (pidNew) foundPriceIds.add(pidNew);
+    if (pidOld) foundPriceIds.add(pidOld);
+  });
 }
 
-// ---------------------------------
-
+// === MAIN HANDLER ===
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     res.status(405).send('Method Not Allowed');
@@ -190,113 +196,108 @@ export default async function handler(req, res) {
     return;
   }
 
-  // 2) Collect price IDs + purchaser email (handle both new & old shapes)
-  const foundPriceIds = new Set();
   const type = event.type;
-
-  async function collectFromSession(sessionId) {
-    try {
-      const s = await stripe.checkout.sessions.retrieve(sessionId, { expand: ['line_items.data.price.product'] });
-      (s.line_items?.data || []).forEach(li => {
-        const pidNew = li?.pricing?.price_details?.price;
-        const pidOld = li?.price?.id;
-        if (pidNew) foundPriceIds.add(pidNew);
-        if (pidOld) foundPriceIds.add(pidOld);
-      });
-      return s;
-    } catch (e) {
-      console.error('Session retrieve failed', e);
-      return null;
-    }
-  }
-
-  function collectFromInvoice(invoice) {
-    (invoice.lines?.data || []).forEach(li => {
-      const pidNew = li?.pricing?.price_details?.price;
-      const pidOld = li?.price?.id;
-      if (pidNew) foundPriceIds.add(pidNew);
-      if (pidOld) foundPriceIds.add(pidOld);
-    });
-  }
-
+  const foundPriceIds = new Set();
   let email = null;
   let fullName = '';
 
   if (type === 'checkout.session.completed') {
-    const s = await collectFromSession(event.data.object.id);
+    const s = await collectFromSession(event.data.object.id, foundPriceIds);
     email = s?.customer_details?.email || s?.customer_email || null;
     fullName = s?.customer_details?.name || '';
     if (!email && s?.customer) {
       try { const c = await stripe.customers.retrieve(s.customer); email = c?.email || null; fullName = fullName || c?.name || ''; } catch {}
     }
-  } else if (type === 'invoice.payment_succeeded') {
+  } else if (type === 'invoice.payment_succeeded' || type === 'invoice.payment_failed') {
     const inv = event.data.object;
-    collectFromInvoice(inv);
+    collectFromInvoice(inv, foundPriceIds);
     email = inv?.customer_email || inv?.customer_details?.email || null;
     if (inv?.customer) {
       try { const c = await stripe.customers.retrieve(inv.customer); fullName = fullName || c?.name || ''; if (!email) email = c?.email || null; } catch {}
     }
-  } else if (type === 'customer.subscription.updated') {
-    // If a subscription is “canceled” immediately, remove access right now.
-    const sub = event.data.object;
-    if (sub?.status === 'canceled') {
-      await revokeAccessByStripeCustomerId(sub.customer);
-    }
-    res.status(200).json({ ok: true, handled: type });
-    return;
   } else if (type === 'customer.subscription.deleted') {
-    // Final end of access (after grace/retries or cancel-at-period-end)
-    const sub = event.data.object;
-    await revokeAccessByStripeCustomerId(sub.customer);
-    res.status(200).json({ ok: true, handled: type });
-    return;
+    // handled below (no prices needed)
   } else {
     // Ignore other events
     res.status(200).json({ ok: true, ignored: type });
     return;
   }
 
-  if (!email) {
-    console.warn('⚠️ No purchaser email on event; skipping');
-    res.status(200).json({ ok: true });
-    return;
-  }
-
-  // 3) Map Stripe Price IDs → BigCommerce group id via JSON env
-  let map = {};
-  try { map = JSON.parse(process.env.PRICE_TO_GROUP_MAP || '{}'); } catch {}
-  let targetGroupId = null;
-  for (const pid of foundPriceIds) {
-    if (pid && map[pid]) { targetGroupId = map[pid]; break; }
-  }
-  console.log(`Prices in event: ${[...foundPriceIds].join(', ') || '(none)'} → target group: ${targetGroupId ?? '(none)'} for ${email}`);
-
-  // 4) Upsert customer in BigCommerce and set group
+  // === ROUTING BY EVENT ===
   try {
-    const parts = (fullName || '').trim().split(/\s+/).filter(Boolean);
-    const firstName = parts[0] || 'Member';
-    const lastName  = parts.slice(1).join(' ') || 'Account';
-
-    // A) Lookup by email (v3→v2)
-    let bcCustomerId = await lookupBcCustomerIdByEmail(email);
-
-    // B) Create if missing (v3→v2). If we know the group, try to set it at create time.
-    let groupAppliedAtCreate = false;
-    if (!bcCustomerId) {
-      const created = await createBcCustomer({ email, firstName, lastName, groupId: targetGroupId || null });
-      bcCustomerId = created.id;
-      groupAppliedAtCreate = created.groupAppliedAtCreate;
-      console.log(`✅ Created BC customer ${bcCustomerId} for ${email} (group at create: ${groupAppliedAtCreate})`);
-    } else {
-      console.log(`ℹ️ Found BC customer ${bcCustomerId} for ${email}`);
+    if (type === 'customer.subscription.deleted') {
+      // Remove from group on cancellation
+      const sub = event.data.object;
+      // Try to get customer email
+      let custEmail = null;
+      try {
+        const c = await stripe.customers.retrieve(sub.customer);
+        custEmail = c?.email || null;
+        fullName = c?.name || '';
+      } catch {}
+      if (!custEmail) {
+        console.warn('No email on subscription.deleted; skipping');
+        res.status(200).json({ ok: true });
+        return;
+      }
+      const bcId = await lookupBcCustomerIdByEmail(custEmail);
+      if (!bcId) {
+        console.warn(`No BC customer for ${custEmail}; nothing to remove.`);
+        res.status(200).json({ ok: true });
+        return;
+      }
+      await setBcCustomerGroup(bcId, NO_GROUP);
+      console.log(`✅ Removed BC group for ${custEmail} (cancelled subscription).`);
+      res.status(200).json({ ok: true });
+      return;
     }
 
-    // C) Assign group if we didn’t apply it during create
-    if (targetGroupId && !groupAppliedAtCreate) {
-      await setBcCustomerGroup(bcCustomerId, targetGroupId);
-      console.log(`✅ Set group ${targetGroupId} for ${email} (BC id ${bcCustomerId})`);
-    } else if (!targetGroupId) {
-      console.log(`ℹ️ No mapped membership in this purchase for ${email}.`);
+    // For successful charges → assign group
+    if (type === 'checkout.session.completed' || type === 'invoice.payment_succeeded') {
+      if (!email) {
+        console.warn('No purchaser email; skipping');
+        res.status(200).json({ ok: true });
+        return;
+      }
+      const targetGroupId = priceToGroupId(foundPriceIds);
+      console.log(`Prices in event: ${[...foundPriceIds].join(', ') || '(none)'} → target group: ${targetGroupId ?? '(none)'} for ${email}`);
+
+      const parts = (fullName || '').trim().split(/\s+/).filter(Boolean);
+      const firstName = parts[0] || 'Member';
+      const lastName  = parts.slice(1).join(' ') || 'Account';
+
+      let bcCustomerId = await lookupBcCustomerIdByEmail(email);
+      let groupAppliedAtCreate = false;
+      if (!bcCustomerId) {
+        const created = await createBcCustomer({ email, firstName, lastName, groupId: targetGroupId || null });
+        bcCustomerId = created.id;
+        groupAppliedAtCreate = created.groupAppliedAtCreate;
+        console.log(`✅ Created BC customer ${bcCustomerId} for ${email} (group at create: ${groupAppliedAtCreate})`);
+      } else {
+        console.log(`ℹ️ Found BC customer ${bcCustomerId} for ${email}`);
+      }
+
+      if (targetGroupId && !groupAppliedAtCreate) {
+        await setBcCustomerGroup(bcCustomerId, targetGroupId);
+        console.log(`✅ Set group ${targetGroupId} for ${email} (BC id ${bcCustomerId})`);
+      } else if (!targetGroupId) {
+        console.log(`ℹ️ No mapped membership in this purchase for ${email}.`);
+      }
+
+      res.status(200).json({ ok: true });
+      return;
+    }
+
+    // Optional: drop access on payment failure
+    if (type === 'invoice.payment_failed' && REMOVE_ON_PAYMENT_FAILED) {
+      if (!email) { res.status(200).json({ ok: true }); return; }
+      const bcId = await lookupBcCustomerIdByEmail(email);
+      if (bcId) {
+        await setBcCustomerGroup(bcId, NO_GROUP);
+        console.log(`⚠️ Payment failed — removed group for ${email}.`);
+      }
+      res.status(200).json({ ok: true });
+      return;
     }
 
     res.status(200).json({ ok: true });
