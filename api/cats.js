@@ -1,8 +1,16 @@
 // /api/cats.js
 // Shim for frontend calling /api/cats with key="email::groupId".
-// Proxies to /api/categories (BigCommerce Notes storage) and forwards admin override.
+// Proxies to /api/categories and adds permissive CORS so the store can call it.
 
 export const config = { api: { bodyParser: true } };
+
+function allowCORS(res) {
+  // You can hardcode your store origin if you prefer:
+  // res.setHeader('Access-Control-Allow-Origin', 'https://www.brainwaveentrainmentstore.net');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Admin-Key');
+}
 
 function emailFromKey(key) {
   const s = String(key || '').trim();
@@ -10,6 +18,9 @@ function emailFromKey(key) {
 }
 
 export default async function handler(req, res) {
+  allowCORS(res);
+  if (req.method === 'OPTIONS') return res.status(204).end();
+
   try {
     const base = `https://${req.headers.host}`;
 
@@ -35,7 +46,6 @@ export default async function handler(req, res) {
       const categories = Array.isArray(req.body?.categories) ? req.body.categories : [];
       if (!email) return res.status(400).json({ error: 'Missing email in key' });
 
-      // Forward X-Admin-Key so you can override
       const adminKey = req.headers['x-admin-key'] || '';
 
       const r = await fetch(`${base}/api/categories`, {
