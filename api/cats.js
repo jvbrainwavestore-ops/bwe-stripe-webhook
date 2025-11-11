@@ -1,15 +1,18 @@
 // /api/cats.js
 // Shim for frontend calling /api/cats with key="email::groupId".
-// Proxies to /api/categories, adds permissive CORS, and provides an admin URL-setter.
+// Proxies to /api/categories and adds permissive CORS so the store can call it.
 
 export const config = { api: { bodyParser: true } };
 
-function allowCORS(res) {
-  // You can hardcode your store origin later if you want:
-  // res.setHeader('Access-Control-Allow-Origin', 'https://www.brainwaveentrainmentstore.net');
+function allowCORS(req, res) {
+  // If you want to lock this down later: replace '*' with your domain.
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Admin-Key');
+
+  // Echo back whatever headers the browser requests during preflight.
+  const reqHdrs = String(req.headers['access-control-request-headers'] || '').trim();
+  const fallback = 'Content-Type, X-Admin-Key, Accept';
+  res.setHeader('Access-Control-Allow-Headers', reqHdrs || fallback);
 }
 
 function emailFromKey(key) {
@@ -18,50 +21,12 @@ function emailFromKey(key) {
 }
 
 export default async function handler(req, res) {
-  allowCORS(res);
+  allowCORS(req, res);
   if (req.method === 'OPTIONS') return res.status(204).end();
 
   try {
     const base = `https://${req.headers.host}`;
 
-    // --- GET helper: admin URL-setter (no console; one-time seeding/override) ---
-    // Usage:
-    //   /api/cats?set=1&admin=YOUR_ADMIN_CATS_KEY&key=user@example.com::2&cats=isochiral%20affirmations,isochiral%20music
-    if (req.method === 'GET' && String(req.query?.set || '') === '1') {
-      const incoming = String(req.query?.admin || '').trim();
-      const adminKey = String(process.env.ADMIN_CATS_KEY || '').trim();
-      if (!adminKey || incoming !== adminKey) {
-        return res.status(403).json({ error: 'Forbidden' });
-      }
-
-      const key = String(req.query?.key || '').trim();
-      const email = emailFromKey(key);
-      const catsRaw = String(req.query?.cats || '').trim();
-      const categories = catsRaw
-        ? catsRaw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
-        : [];
-
-      if (!email || !categories.length) {
-        return res.status(400).json({ error: 'Missing email or categories' });
-      }
-
-      // Forward as admin POST to /api/categories (respects write-once with admin override)
-      const r = await fetch(`${base}/api/categories`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-          'X-Admin-Key': adminKey
-        },
-        body: JSON.stringify({ email, categories })
-      });
-      const txt = await r.text().catch(() => '');
-      if (!r.ok) return res.status(r.status).send(txt || 'Error');
-      const j = JSON.parse(txt || '{}');
-      return res.status(200).json({ ok: true, categories: j.categories || [] });
-    }
-
-    // --- GET reader: returns { categories: [...] } for key=email::groupId ---
     if (req.method === 'GET') {
       const key = (req.query?.key || '').trim();
       const email = emailFromKey(key);
@@ -78,7 +43,6 @@ export default async function handler(req, res) {
       return res.status(200).json({ categories: Array.isArray(j.categories) ? j.categories : [] });
     }
 
-    // --- POST writer: proxy to /api/categories (passes optional X-Admin-Key through) ---
     if (req.method === 'POST') {
       const key = (req.body?.key || '').trim();
       const email = emailFromKey(key);
