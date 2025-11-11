@@ -1,6 +1,6 @@
 // api/categories.js
 // GET  /api/categories?email=...  -> { categories:[...], groupId, limit }
-// POST /api/categories { email, categories:[...] }  -> saves (enforces limit by BigCommerce group)
+// POST /api/categories { email, categories:[...] } -> saves (enforces limit by BigCommerce group)
 //
 // Stores selection inside the BigCommerce customer "notes" field under a tagged line:
 // [[BWE_CATEGORIES:focus,sleep]]
@@ -96,7 +96,7 @@ async function updateCustomerNotes(id, notes) {
 
 // ---- encode/decode categories inside notes (non-destructive) ----
 const TAG_START = '[[BWE_CATEGORIES:';
-const TAG_END = ']]';
+const TAG_END   = ']]';
 
 function extractCatsFromNotes(notes) {
   const s = String(notes || '');
@@ -130,38 +130,61 @@ export default async function handler(req, res) {
       const id = await lookupCustomerByEmail(email);
       if (!id) return res.status(200).json({ categories: [], groupId: 0, limit: 2 });
 
-      const cust = await getCustomerById(id);
-      const groupId = Number(cust?.customer_group_id || 0);
-      const cats = extractCatsFromNotes(cust?.notes || '');
-      const limit = limitForGroup(groupId);
+      const cust   = await getCustomerById(id);
+      const groupId= Number(cust?.customer_group_id || 0);
+      const cats   = extractCatsFromNotes(cust?.notes || '');
+      const limit  = limitForGroup(groupId);
 
       return res.status(200).json({ categories: cats, groupId, limit });
     }
 
     if (req.method === 'POST') {
-      const email = (req.body?.email || '').trim();
-      let cats = Array.isArray(req.body?.categories) ? req.body.categories : [];
-      if (!email) return res.status(400).json({ error: 'Missing email' });
+      const emailRaw = (req.body?.email || '').trim();
+      let cats       = Array.isArray(req.body?.categories) ? req.body.categories : [];
+      if (!emailRaw) return res.status(400).json({ error: 'Missing email' });
 
+      // Admin override: send header X-Admin-Key matching Vercel env ADMIN_CATS_KEY
+      const incomingAdminKey = String(req.headers['x-admin-key'] || req.body?.adminKey || '').trim();
+      const adminKey         = String(process.env.ADMIN_CATS_KEY || '').trim();
+      const isAdmin          = adminKey && incomingAdminKey === adminKey;
+
+      // Normalize inputs
+      const email = emailRaw.toLowerCase();
+      cats = cats.map(c => String(c || '').trim().toLowerCase()).filter(Boolean);
+      const unique = Array.from(new Set(cats));
+
+      // Resolve/create customer
       let id = await lookupCustomerByEmail(email);
       if (!id) id = await createCustomer(email);
       if (!id) return res.status(500).json({ error: 'Could not resolve or create customer' });
 
-      const cust = await getCustomerById(id);
+      // Current state + limit by plan
+      const cust    = await getCustomerById(id);
       const groupId = Number(cust?.customer_group_id || 0);
-      const limit = limitForGroup(groupId);
+      const limit   = limitForGroup(groupId);
 
-      // Enforce limit for the member’s group
-      cats = cats.map(c => String(c || '').trim().toLowerCase()).filter(Boolean);
-      const unique = Array.from(new Set(cats));
+      // Enforce plan limit
       if (unique.length !== limit) {
         return res.status(400).json({ error: `Your plan allows exactly ${limit} categories`, groupId, limit });
       }
 
+      // WRITE-ONCE lock (users cannot change after first save; admin can)
+      const existing = extractCatsFromNotes(cust?.notes || '');
+      if (Array.isArray(existing) && existing.length === limit && !isAdmin) {
+        return res.status(200).json({ ok: true, categories: existing, groupId, limit, locked: true });
+      }
+
+      // Write (first save, or admin override)
       const newNotes = setCatsInNotes(cust?.notes || '', unique);
       await updateCustomerNotes(id, newNotes);
 
-      return res.status(200).json({ ok: true, categories: unique, groupId, limit });
+      return res.status(200).json({
+        ok: true,
+        categories: unique,
+        groupId,
+        limit,
+        locked: isAdmin ? 'admin-overwrite' : 'fresh'
+      });
     }
 
     return res.status(405).json({ error: 'Method Not Allowed' });
