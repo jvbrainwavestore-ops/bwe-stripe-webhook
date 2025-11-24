@@ -17,6 +17,15 @@ const GROUP_LIMITS = {
   4: 4  // Collective (later)
 };
 
+// ---- ADMIN KEY for override (one extra category) ----
+const ADMIN_CATS_KEY = (process.env.ADMIN_CATS_KEY || '').trim();
+
+function isAdmin(req) {
+  if (!ADMIN_CATS_KEY) return false;
+  const headerKey = String(req.headers['x-admin-key'] || '').trim();
+  return headerKey && headerKey === ADMIN_CATS_KEY;
+}
+
 // ---- BigCommerce helpers ----
 function bcHeaders() {
   return {
@@ -155,17 +164,30 @@ export default async function handler(req, res) {
       const groupId = Number(cust?.customer_group_id || 0);
       const limit = limitForGroup(groupId);
 
-      // Enforce limit for the member’s group
+      // NEW: detect admin override & allow one extra category
+      const adminUser = isAdmin(req);
+      const allowExtra = adminUser && req.body && req.body.allowExtra === true;
+
+      let allowedLimit = limit;
+      if (allowExtra) {
+        allowedLimit = limit + 1;
+      }
+
+      // Enforce limit for the member’s group (with possible +1 for admin override)
       cats = cats.map(c => String(c || '').trim().toLowerCase()).filter(Boolean);
       const unique = Array.from(new Set(cats));
-      if (unique.length !== limit) {
-        return res.status(400).json({ error: `Your plan allows exactly ${limit} categories`, groupId, limit });
+      if (unique.length !== allowedLimit) {
+        return res.status(400).json({
+          error: `Your plan allows exactly ${allowedLimit} categories`,
+          groupId,
+          limit: allowedLimit
+        });
       }
 
       const newNotes = setCatsInNotes(cust?.notes || '', unique);
       await updateCustomerNotes(id, newNotes);
 
-      return res.status(200).json({ ok: true, categories: unique, groupId, limit });
+      return res.status(200).json({ ok: true, categories: unique, groupId, limit: allowedLimit });
     }
 
     return res.status(405).json({ error: 'Method Not Allowed' });
