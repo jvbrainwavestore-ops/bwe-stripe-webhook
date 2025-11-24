@@ -47,6 +47,10 @@ export default async function handler(req, res) {
       const key = (req.body?.key || '').trim();
       const email = emailFromKey(key);
       const categories = Array.isArray(req.body?.categories) ? req.body.categories : [];
+
+      // NEW: pass through allowExtra (if present)
+      const allowExtra = !!(req.body && req.body.allowExtra);
+
       if (!email) return res.status(400).json({ error: 'Missing email in key' });
 
       const adminKey = req.headers['x-admin-key'] || '';
@@ -58,7 +62,7 @@ export default async function handler(req, res) {
           'Accept': 'application/json',
           'X-Admin-Key': String(adminKey)
         },
-        body: JSON.stringify({ email, categories })
+        body: JSON.stringify({ email, categories, allowExtra }) // ← include allowExtra
       });
       const txt = await r.text().catch(() => '');
       if (!r.ok) return res.status(r.status).send(txt || 'Error');
