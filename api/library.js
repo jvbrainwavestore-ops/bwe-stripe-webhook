@@ -33,13 +33,25 @@ export default async function handler(req, res) {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Robots-Tag', 'noindex, nofollow');
 
-    // CORS: allow your storefront when calling from the browser
-    const allowed = process.env.SITE_ORIGIN || 'https://www.brainwaveentrainmentstore.net';
-    const origin = req.headers.origin || '';
-    if (origin === allowed) {
-      res.setHeader('Access-Control-Allow-Origin', origin);
-      res.setHeader('Vary', 'Origin');
-    }
+  // CORS: allow your storefront when calling from the browser (both hosts)
+const origin = req.headers.origin || '';
+
+if (
+  origin === 'https://brainwaveentrainmentstore.net' ||
+  origin === 'https://www.brainwaveentrainmentstore.net'
+) {
+  res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Vary', 'Origin');
+}
+
+res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+if (req.method === 'OPTIONS') {
+  res.status(204).end();
+  return;
+}
+
 
     res.status(200).send(csvText);
   } catch (err) {
